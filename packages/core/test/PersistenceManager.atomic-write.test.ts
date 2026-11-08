@@ -72,6 +72,41 @@ describe("PersistenceManager atomic writes", () => {
 		expect(files).toEqual(["edge-worker-state.json"]);
 	});
 
+	it("serializes concurrent saves in order and captures each snapshot immediately", async () => {
+		const mutable = structuredClone(sampleState);
+		const first = manager.saveEdgeWorkerState(mutable);
+		mutable.issueRepositoryCache = { "issue-1": ["repo-2"] };
+		const second = manager.saveEdgeWorkerState(mutable);
+		mutable.issueRepositoryCache = { "issue-1": ["unsaved-mutation"] };
+		await Promise.all([first, second]);
+		expect((await manager.loadEdgeWorkerState())?.issueRepositoryCache).toEqual(
+			{ "issue-1": ["repo-2"] },
+		);
+		expect(await readdir(dir)).toEqual(["edge-worker-state.json"]);
+	});
+
+	it("round-trips optional parked replay context in the existing v4 format", async () => {
+		const state: SerializableEdgeWorkerState = {
+			...sampleState,
+			parkedSessions: {
+				"issue-2": {
+					agentSession: {
+						id: "session-2",
+						issue: { id: "issue-2", identifier: "REC-2", title: "Waiting" },
+					} as never,
+					repositoryIds: ["repo-1"],
+					linearWorkspaceId: "workspace-1",
+					baseBranchOverrides: { "repo-1": "release" },
+					commentBody: "Keep this request after restart",
+					blockingIssueIds: ["issue-1"],
+					phase: "starting",
+				},
+			},
+		};
+		await manager.saveEdgeWorkerState(state);
+		expect(await manager.loadEdgeWorkerState()).toEqual(state);
+	});
+
 	it("persists complete, parseable JSON", async () => {
 		await manager.saveEdgeWorkerState(sampleState);
 		const raw = await readFile(join(dir, "edge-worker-state.json"), "utf8");

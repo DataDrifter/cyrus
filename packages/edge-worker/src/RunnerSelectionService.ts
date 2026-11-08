@@ -1,4 +1,9 @@
-import type { EdgeWorkerConfig, RunnerType } from "cyrus-core";
+import type {
+	AgentRunnerConfig,
+	EdgeWorkerConfig,
+	PublicationPolicy,
+	RunnerType,
+} from "cyrus-core";
 
 export class RunnerSelectionService {
 	private config: EdgeWorkerConfig;
@@ -14,6 +19,69 @@ export class RunnerSelectionService {
 		this.config = config;
 	}
 
+	public assertRunnerAllowed(
+		runnerType: RunnerType,
+		context = "session",
+	): void {
+		const allowed = this.config.allowedRunners;
+		if (allowed && !allowed.includes(runnerType)) {
+			throw new Error(
+				`Execution provider '${runnerType}' is not permitted for ${context}. Allowed providers: ${allowed.join(", ") || "none"}.`,
+			);
+		}
+	}
+
+	public getCursorConfig(): Pick<
+		AgentRunnerConfig,
+		"cursorTeamId" | "cursorAccountEmail" | "cursorSettingSources"
+	> {
+		return {
+			cursorTeamId: this.config.cursorTeamId,
+			cursorAccountEmail: this.config.cursorAccountEmail,
+			cursorSettingSources: this.config.cursorSettingSources,
+		};
+	}
+
+	public getWorkspaceSupportPaths(): string[] | undefined {
+		return this.config.workspaceSupportPaths;
+	}
+
+	public getRunnerPolicy(): { guidance: string; disallowedTools: string[] } {
+		const allowed = this.config.allowedRunners;
+		if (!allowed) return { guidance: "", disallowedTools: [] };
+		const commands: Record<RunnerType, string[]> = {
+			claude: ["claude"],
+			codex: ["codex"],
+			gemini: ["gemini"],
+			opencode: ["opencode"],
+			cursor: ["agent", "cursor-agent"],
+		};
+		const denied = (Object.keys(commands) as RunnerType[]).filter(
+			(runner) => !allowed.includes(runner),
+		);
+		return {
+			guidance: [
+				"<execution_provider_policy>",
+				`Use only these execution providers: ${allowed.join(", ")}.`,
+				"Apply this restriction to parents, children, model fallbacks, and resumed sessions.",
+				"Native Cursor Task children must use the same Cursor account and configured team as their parent.",
+				"Do not launch another provider's CLI, SDK, or API from a shell or tool. A model name does not authorize another provider account.",
+				"If the permitted provider cannot complete the work, report the blocker instead of switching providers.",
+				"</execution_provider_policy>",
+			].join("\n"),
+			disallowedTools: denied.flatMap((runner) =>
+				commands[runner].flatMap((command) => [
+					`Bash(${command}:*)`,
+					`Bash(*/${command}:*)`,
+				]),
+			),
+		};
+	}
+
+	public getPublicationPolicy(): PublicationPolicy | undefined {
+		return this.config.publicationPolicy;
+	}
+
 	/**
 	 * Determine the default runner type.
 	 *
@@ -24,7 +92,16 @@ export class RunnerSelectionService {
 	 */
 	public getDefaultRunner(): RunnerType {
 		if (this.config.defaultRunner) {
+			this.assertRunnerAllowed(this.config.defaultRunner, "configured default");
 			return this.config.defaultRunner;
+		}
+		if (this.config.allowedRunners?.length === 0) {
+			throw new Error(
+				"allowedRunners must contain at least one execution provider.",
+			);
+		}
+		if (this.config.allowedRunners?.length === 1) {
+			return this.config.allowedRunners[0]!;
 		}
 
 		// Auto-detect from environment: if exactly one runner's API key is set, use it
@@ -42,11 +119,18 @@ export class RunnerSelectionService {
 			available.push("cursor");
 		}
 
-		if (available.length === 1 && available[0]) {
-			return available[0];
+		const permitted = available.filter(
+			(runner) =>
+				!this.config.allowedRunners ||
+				this.config.allowedRunners.includes(runner),
+		);
+		if (permitted.length === 1 && permitted[0]) {
+			return permitted[0];
 		}
-
-		return "claude";
+		return this.config.allowedRunners?.includes("claude") ||
+			!this.config.allowedRunners
+			? "claude"
+			: this.config.allowedRunners[0]!;
 	}
 
 	/**
@@ -233,6 +317,9 @@ export class RunnerSelectionService {
 				}
 				return "gemini-2.5-flash";
 			}
+			if (runnerType === "cursor") {
+				return defaultFallbackByRunner.cursor;
+			}
 			if (runnerType === "opencode") {
 				return defaultFallbackByRunner.opencode;
 			}
@@ -351,17 +438,30 @@ export class RunnerSelectionService {
 			providerModelFromLabels?.model || resolveModelFromLabel(normalizedLabels);
 		const explicitModel = modelFromDescription || modelFromLabels;
 
+		const inferredRunner = inferRunnerFromModel(explicitModel);
+		const permittedInferredRunner =
+			inferredRunner &&
+			(!this.config.allowedRunners ||
+				this.config.allowedRunners.includes(inferredRunner))
+				? inferredRunner
+				: undefined;
 		const runnerType: RunnerType =
 			resolvedAgentFromDescription ||
 			providerModelFromLabels?.runnerType ||
 			resolvedAgentFromLabels ||
-			inferRunnerFromModel(explicitModel) ||
+			permittedInferredRunner ||
 			this.getDefaultRunner();
+		this.assertRunnerAllowed(runnerType, "issue selection");
 
 		// If an explicit agent conflicts with model's implied runner, keep the agent and reset model.
 		const modelRunner = inferRunnerFromModel(explicitModel);
 		let modelOverride = explicitModel;
-		if (modelOverride && modelRunner && modelRunner !== runnerType) {
+		if (
+			modelOverride &&
+			modelRunner &&
+			modelRunner !== runnerType &&
+			runnerType !== "cursor"
+		) {
 			modelOverride = undefined;
 		}
 

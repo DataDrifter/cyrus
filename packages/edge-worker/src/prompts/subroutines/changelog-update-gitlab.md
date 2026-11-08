@@ -2,6 +2,11 @@
 
 All verification checks have passed. Now update the changelog if the project uses one.
 
+First apply `<publication_policy>`. With `local-only` or `branch-only`, skip
+draft MR creation and all MR updates. Write the changelog entry without an MR
+number or link, then report the local or approved published commit. The steps
+below that create or update an MR apply only when no such policy is configured.
+
 ## Your Tasks
 
 ### 1. Push Current Branch and Create Draft MR

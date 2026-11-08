@@ -123,6 +123,12 @@ export type IAgentProgressEvent =
  * ```
  */
 export interface ISimpleAgentRunnerConfig<T extends string> {
+	/** Cursor team used by lightweight classification and routing agents. */
+	cursorTeamId?: number;
+	/** Expected Cursor account identity, checked before creating or resuming an agent. */
+	cursorAccountEmail?: string;
+	/** Cursor settings sources. Project permissions always remain loaded. */
+	cursorSettingSources?: Array<"user" | "project">;
 	/** Valid response options that the agent must choose from */
 	validResponses: readonly T[];
 

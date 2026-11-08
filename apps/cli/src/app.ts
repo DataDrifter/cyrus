@@ -13,6 +13,7 @@ import { CheckTokensCommand } from "./commands/CheckTokensCommand.js";
 import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
 import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
 import { SelfAuthCommand } from "./commands/SelfAuthCommand.js";
+import { SelfAuthCursorCommand } from "./commands/SelfAuthCursorCommand.js";
 import { StartCommand } from "./commands/StartCommand.js";
 import { createErrorReporter } from "./services/createErrorReporter.js";
 
@@ -125,6 +126,27 @@ program
 			errorReporter,
 		);
 		await new SelfAuthCommand(app).execute([]);
+	});
+
+program
+	.command("self-auth-cursor")
+	.description(
+		"Sign Cyrus into the intended Cursor account without changing the global SDK login",
+	)
+	.requiredOption("--email <email>", "Expected Cursor account email")
+	.requiredOption("--team-id <id>", "Cursor Team ID for inference")
+	.action(async (commandOptions: { email: string; teamId: string }) => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		await new SelfAuthCursorCommand(app).execute([
+			commandOptions.email,
+			commandOptions.teamId,
+		]);
 	});
 
 // Self-add-repo command - Clone and add repository

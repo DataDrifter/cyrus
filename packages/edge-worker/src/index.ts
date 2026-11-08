@@ -1,4 +1,5 @@
 // Re-export useful types from dependencies
+
 export type { SDKMessage } from "cyrus-claude-runner";
 export { getAllTools, readOnlyTools } from "cyrus-claude-runner";
 export type {
@@ -10,6 +11,10 @@ export type {
 	UserIdentifier,
 	Workspace,
 } from "cyrus-core";
+export {
+	type CyrusCursorLoginOptions,
+	loginCyrusCursor,
+} from "cyrus-cursor-runner";
 export { AgentSessionManager } from "./AgentSessionManager.js";
 export type {
 	AskUserQuestionHandlerConfig,

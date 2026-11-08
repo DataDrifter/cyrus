@@ -1,5 +1,10 @@
 # GitLab MR - Merge Request Management
 
+If `<publication_policy>` is present, do not create or modify an MR. Report
+that the configured local-only or branch-only workflow ends with a commit or
+branch, then stop this subroutine. The remaining steps apply only when the
+active policy permits MR operations.
+
 A draft MR exists and all changes have been committed and pushed. Now update the MR with a full description and optionally mark it as ready.
 
 ## Your Tasks

@@ -21,6 +21,8 @@ export {
 	OpenCodeConfigSchema,
 	type OpenCodeStateScope,
 	OpenCodeStateScopeSchema,
+	type PublicationPolicy,
+	PublicationPolicySchema,
 	type RepositoryConfig,
 	type RepositoryConfigPayload,
 	RepositoryConfigPayloadSchema,

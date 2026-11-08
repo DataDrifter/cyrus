@@ -16,6 +16,7 @@ import type {
 	ILogger,
 	OnAskUserQuestion,
 	OpenCodeConfigOverrides,
+	PublicationPolicy,
 	RepositoryConfig,
 	RunnerType,
 } from "cyrus-core";
@@ -25,6 +26,7 @@ import { appendBrowserUseAddendum } from "./prompts/browserUsePromptAddendum.js"
 import { appendCloudRuntimeAddendum } from "./prompts/cloudRuntimePromptAddendum.js";
 import { appendFailureModeAddendum } from "./prompts/failureModePromptAddendum.js";
 import { appendGitHubCliMediaAddendum } from "./prompts/githubCliMediaPromptAddendum.js";
+import { resolvePublicationPolicy } from "./publicationPolicy.js";
 
 /**
  * Subset of McpConfigService consumed by RunnerConfigBuilder.
@@ -54,6 +56,14 @@ export interface IChatToolResolver {
  * Subset of RunnerSelectionService consumed by RunnerConfigBuilder.
  */
 export interface IRunnerSelector {
+	getWorkspaceSupportPaths?(): string[] | undefined;
+	getRunnerPolicy?(): { guidance: string; disallowedTools: string[] };
+	assertRunnerAllowed?(runnerType: RunnerType, context?: string): void;
+	getCursorConfig?(): Pick<
+		AgentRunnerConfig,
+		"cursorTeamId" | "cursorAccountEmail" | "cursorSettingSources"
+	>;
+	getPublicationPolicy?(): PublicationPolicy | undefined;
 	getDefaultRunner(): RunnerType;
 	determineRunnerSelection(
 		labels: string[],
@@ -292,6 +302,16 @@ export class RunnerConfigBuilder {
 		input.logger.debug("Chat session allowed tools:", allowedTools);
 		const runnerType =
 			input.runnerType ?? this.runnerSelector.getDefaultRunner();
+		this.runnerSelector.assertRunnerAllowed?.(runnerType, "chat session");
+		const runnerPolicy = this.runnerSelector.getRunnerPolicy?.() ?? {
+			guidance: "",
+			disallowedTools: [],
+		};
+		const publicationPolicy = this.runnerSelector.getPublicationPolicy?.();
+		const publication = resolvePublicationPolicy(
+			input.workspacePath,
+			publicationPolicy,
+		);
 
 		// Shared auto-memory across all chat threads on this platform. Lives
 		// under cyrusHome (not the per-thread workspace) so memory built up in
@@ -305,7 +325,18 @@ export class RunnerConfigBuilder {
 			runnerType,
 			workingDirectory: input.workspacePath,
 			allowedTools,
-			disallowedTools: [] as string[],
+			disallowedTools: [
+				...publication.disallowedTools,
+				...runnerPolicy.disallowedTools,
+			],
+			publicationPolicy,
+			workspaceSupportPaths: input.repository
+				? this.runnerSelector.getWorkspaceSupportPaths?.()
+				: undefined,
+			workspaceSupportSource: input.repository?.repositoryPath,
+			...(runnerType === "cursor"
+				? this.runnerSelector.getCursorConfig?.()
+				: {}),
 			allowedDirectories: [
 				input.workspacePath,
 				autoMemoryDirectory,
@@ -317,7 +348,11 @@ export class RunnerConfigBuilder {
 			appendSystemPrompt: appendCloudRuntimeAddendum(
 				appendGitHubCliMediaAddendum(
 					appendBrowserUseAddendum(
-						appendFailureModeAddendum(input.systemPrompt),
+						appendFailureModeAddendum(
+							[input.systemPrompt, publication.guidance, runnerPolicy.guidance]
+								.filter(Boolean)
+								.join("\n\n"),
+						),
 					),
 				),
 			),
@@ -359,9 +394,18 @@ export class RunnerConfigBuilder {
 		// Configure hooks: PostToolUse for screenshot tools + PR-marker enforcement,
 		// plus the Stop hook that blocks the session when work is unshipped.
 		const screenshotHooks = this.buildScreenshotHooks(log);
-		const prMarkerHook = buildPrMarkerHook(log);
+		const runnerPolicy = this.runnerSelector.getRunnerPolicy?.() ?? {
+			guidance: "",
+			disallowedTools: [],
+		};
+		const publicationPolicy = this.runnerSelector.getPublicationPolicy?.();
+		const publication = resolvePublicationPolicy(
+			input.session.workspace.path,
+			publicationPolicy,
+		);
+		const prMarkerHook = publicationPolicy ? {} : buildPrMarkerHook(log);
 		const intentToAddHook = buildIntentToAddHook(log);
-		const stopHook = this.buildStopHook(log);
+		const stopHook = publicationPolicy ? {} : this.buildStopHook(log);
 		const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
 			...stopHook,
 			PostToolUse: [
@@ -407,6 +451,11 @@ export class RunnerConfigBuilder {
 			fallbackModelOverride =
 				this.runnerSelector.getDefaultFallbackModelForRunner("opencode");
 		}
+
+		this.runnerSelector.assertRunnerAllowed?.(
+			runnerType,
+			"resumed issue session",
+		);
 
 		// Log model override if found
 		if (modelOverride) {
@@ -458,7 +507,14 @@ export class RunnerConfigBuilder {
 		const config: AgentRunnerConfig & Record<string, unknown> = {
 			workingDirectory: cwd,
 			allowedTools: input.allowedTools,
-			disallowedTools: input.disallowedTools,
+			disallowedTools: [
+				...input.disallowedTools,
+				...publication.disallowedTools,
+				...runnerPolicy.disallowedTools,
+			],
+			publicationPolicy,
+			workspaceSupportPaths: this.runnerSelector.getWorkspaceSupportPaths?.(),
+			workspaceSupportSource: input.repository.repositoryPath,
 			allowedDirectories: input.allowedDirectories,
 			...(additionalDirectories.length > 0 && { additionalDirectories }),
 			workspaceName: input.session.issue?.identifier || input.session.issueId,
@@ -469,7 +525,11 @@ export class RunnerConfigBuilder {
 			appendSystemPrompt: appendCloudRuntimeAddendum(
 				appendGitHubCliMediaAddendum(
 					appendBrowserUseAddendum(
-						appendFailureModeAddendum(input.systemPrompt),
+						appendFailureModeAddendum(
+							[input.systemPrompt, publication.guidance, runnerPolicy.guidance]
+								.filter(Boolean)
+								.join("\n\n") || undefined,
+						),
 					),
 				),
 			),
@@ -535,6 +595,7 @@ export class RunnerConfigBuilder {
 		// auto-discovers the bundled `cursorsandbox` helper from the
 		// platform-specific optionalDependency.
 		if (runnerType === "cursor") {
+			Object.assign(config, this.runnerSelector.getCursorConfig?.());
 			config.cursorApiKey = process.env.CURSOR_API_KEY || undefined;
 			if (input.sandboxSettings) {
 				config.sandboxSettings = input.sandboxSettings;
@@ -614,7 +675,11 @@ export class RunnerConfigBuilder {
 	}
 
 	private runnerSupportsManagedSkills(runnerType: RunnerType): boolean {
-		return runnerType === "claude" || runnerType === "codex";
+		return (
+			runnerType === "claude" ||
+			runnerType === "codex" ||
+			runnerType === "cursor"
+		);
 	}
 
 	/**

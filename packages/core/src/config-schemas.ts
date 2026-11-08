@@ -380,6 +380,15 @@ export const RepositoryConfigSchema = z.object({
  * It contains global settings that apply across all repositories,
  * plus the array of repository-specific configurations.
  */
+export const PublicationPolicySchema = z.discriminatedUnion("mode", [
+	z.object({ mode: z.literal("local-only") }),
+	z.object({
+		mode: z.literal("branch-only"),
+		repositoryUrl: z.string().min(1),
+	}),
+]);
+export type PublicationPolicy = z.infer<typeof PublicationPolicySchema>;
+
 export const EdgeConfigSchema = z.object({
 	/** Array of repository configurations */
 	repositories: z.array(RepositoryConfigSchema),
@@ -424,6 +433,18 @@ export const EdgeConfigSchema = z.object({
 	/** Default Cursor fallback model if primary Cursor model is unavailable */
 	cursorDefaultFallbackModel: z.string().optional(),
 
+	/** Cursor team selected for every SDK session, including resumes. */
+	cursorTeamId: z.number().int().positive().optional(),
+
+	/** Expected Cursor account email. The runner rejects a different authenticated account before creating or resuming an agent. */
+	cursorAccountEmail: z.string().email().optional(),
+
+	/** Additional Cursor settings sources. Project permissions always remain loaded. */
+	cursorSettingSources: z.array(z.enum(["user", "project"])).optional(),
+
+	/** Complete installed workflow support entries copied from the source checkout to each worktree. */
+	workspaceSupportPaths: z.array(z.string().min(1)).optional(),
+
 	/** Default OpenCode model to use across all repositories (e.g., "openai/gpt-5.5", "anthropic/claude-sonnet-4.5") */
 	opencodeDefaultModel: z.string().optional(),
 
@@ -442,6 +463,12 @@ export const EdgeConfigSchema = z.object({
 	 * otherwise falls back to "claude".
 	 */
 	defaultRunner: RunnerTypeSchema.optional(),
+
+	/** Allowed execution providers. Omit to retain unrestricted provider selection. */
+	allowedRunners: z.array(RunnerTypeSchema).min(1).optional(),
+
+	/** Publication limits applied before a session starts. */
+	publicationPolicy: PublicationPolicySchema.optional(),
 
 	/**
 	 * @deprecated Use claudeDefaultModel instead.

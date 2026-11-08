@@ -186,10 +186,10 @@ export class SkillsPluginResolver {
 		// Union repo-local skills shipped in each participating repo's working
 		// tree. No scope.json filtering — presence in the repo is the scope.
 		for (const repoPath of context?.repoPaths ?? []) {
-			const skillsDir = join(repoPath, ".claude", "skills");
-			const entries = await this.readSkillDirEntries(skillsDir);
-			for (const entry of entries) {
-				skillNames.push(entry);
+			for (const harness of [".agents", ".cursor", ".claude"]) {
+				const skillsDir = join(repoPath, harness, "skills");
+				const entries = await this.readSkillDirEntries(skillsDir);
+				for (const entry of entries) skillNames.push(entry);
 			}
 		}
 

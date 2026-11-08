@@ -11,7 +11,11 @@ import type {
 // Import the AskUserQuestionInput type from the SDK's tool input types
 // This ensures we use the SDK's official type definitions
 import type { AskUserQuestionInput as SDKAskUserQuestionInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
-import type { OpenCodeStateScope, RunnerType } from "./config-schemas.js";
+import type {
+	OpenCodeStateScope,
+	PublicationPolicy,
+	RunnerType,
+} from "./config-schemas.js";
 import type { ILogger } from "./logging/ILogger.js";
 
 // ============================================================================
@@ -452,6 +456,18 @@ export type JsonObject = { [key: string]: JsonValue };
  * ```
  */
 export interface AgentRunnerConfig {
+	/** Source checkout containing complete installed workflow support. */
+	workspaceSupportSource?: string;
+	/** Relative package entries copied into the actual worktree before discovery. */
+	workspaceSupportPaths?: string[];
+	/** Cursor team used for SDK create and resume operations. */
+	cursorTeamId?: number;
+	/** Expected Cursor account identity, checked before creating or resuming an agent. */
+	cursorAccountEmail?: string;
+	/** Cursor settings sources. Project permissions must always remain loaded. */
+	cursorSettingSources?: Array<"user" | "project">;
+	/** Restricts automatic publication for this session. */
+	publicationPolicy?: PublicationPolicy;
 	/** Working directory for the agent session */
 	workingDirectory?: string;
 	/** List of allowed tool names (e.g., ["Read", "Edit", "Bash"]) */

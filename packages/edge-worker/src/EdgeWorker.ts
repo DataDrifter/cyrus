@@ -56,6 +56,7 @@ import type {
 	WebhookIssue,
 } from "cyrus-core";
 import {
+	AgentSessionStatus,
 	CLIIssueTrackerService,
 	CLIRPCServer,
 	createLogger,
@@ -321,14 +322,20 @@ export class EdgeWorker extends EventEmitter {
 		{
 			agentSession: AgentSessionCreatedWebhook["agentSession"];
 			repositories: RepositoryConfig[];
+			repositoryIds?: string[];
 			linearWorkspaceId: string;
 			guidance?: AgentSessionCreatedWebhook["guidance"];
 			commentBody?: string | null;
 			baseBranchOverrides?: Map<string, string>;
 			routingMethod?: string;
 			blockingIssueIds: string[];
+			phase?: "waiting" | "starting";
 		}
 	>();
+	private wakingParkedSessions = new Set<string>();
+	private canceledParkedStarts = new Set<string>();
+	private parkedSessionTimer?: ReturnType<typeof setInterval>;
+	private stopping = false;
 
 	/**
 	 * Resolve `~/` prefixes in path-bearing config fields that are otherwise
@@ -672,6 +679,7 @@ export class EdgeWorker extends EventEmitter {
 	 * Start the edge worker
 	 */
 	async start(): Promise<void> {
+		this.stopping = false;
 		// If cyrus-hosted has pushed per-org GitHub App tokens previously, make
 		// sure the git credential helper and the per-invocation gh token
 		// resolver are wired up (idempotent). Covers the case where the
@@ -792,6 +800,11 @@ export class EdgeWorker extends EventEmitter {
 
 		// Start shared application server (this also starts Cloudflare tunnel if CLOUDFLARE_TOKEN is set)
 		await this.sharedApplicationServer.start();
+		await this.reconcileParkedSessions();
+		this.parkedSessionTimer = setInterval(() => {
+			void this.reconcileParkedSessions();
+		}, 60_000);
+		this.parkedSessionTimer.unref();
 	}
 
 	/**
@@ -2984,6 +2997,8 @@ ${taskSection}`;
 	 * Stop the edge worker
 	 */
 	async stop(): Promise<void> {
+		this.stopping = true;
+		clearInterval(this.parkedSessionTimer);
 		// Stop config file watcher
 		await this.configManager.stop();
 		this.planeIssueTracker?.dispose();
@@ -3781,6 +3796,7 @@ ${taskSection}`;
 		);
 
 		const issueId = message.workItemId;
+		await this.cancelParkedSession(issueId);
 
 		// Stop all active sessions for this issue
 		const sessions = this.agentSessionManager.getSessionsByIssueId(issueId);
@@ -3825,6 +3841,7 @@ ${taskSection}`;
 		this.logger.info(
 			`Completed cleanup for ${message.workItemIdentifier}: stopped ${sessions.length} session(s)`,
 		);
+		await this.reconcileParkedSessions();
 	}
 
 	// ============================================================================
@@ -3843,6 +3860,7 @@ ${taskSection}`;
 		}
 
 		const issueId = webhook.notification.issue.id;
+		await this.cancelParkedSession(issueId);
 
 		// Get cached repository, with fallback to searching sessions
 		let repository = this.getCachedRepository(issueId);
@@ -4152,238 +4170,213 @@ ${taskSection}`;
 				issue.id,
 				linearWorkspaceId,
 			);
-			if (!fullIssue) {
-				return {
-					blocked: false,
-					blockingIssueIds: [],
-					blockingIdentifiers: [],
-				};
-			}
-
-			const blockingIssues =
-				await this.promptBuilder.fetchBlockingIssues(fullIssue);
-			if (blockingIssues.length === 0) {
-				return {
-					blocked: false,
-					blockingIssueIds: [],
-					blockingIdentifiers: [],
-				};
-			}
-
-			// Filter to only unresolved blockers (not completed or canceled)
-			const unresolvedBlockers: Array<{
-				id: string;
-				identifier: string;
-			}> = [];
-			for (const blocker of blockingIssues) {
-				try {
-					const state = await blocker.state;
-					if (
-						state &&
-						state.type !== "completed" &&
-						state.type !== "canceled"
-					) {
-						unresolvedBlockers.push({
-							id: blocker.id,
-							identifier: blocker.identifier,
-						});
-					}
-				} catch {
-					// If we can't resolve the state, assume it's unresolved
-					unresolvedBlockers.push({
-						id: blocker.id,
-						identifier: blocker.identifier,
-					});
-				}
-			}
-
-			if (unresolvedBlockers.length === 0) {
-				return {
-					blocked: false,
-					blockingIssueIds: [],
-					blockingIdentifiers: [],
-				};
-			}
-
+			if (!fullIssue)
+				throw new Error("Issue dependencies could not be fetched");
+			const blockers = await this.fetchUnresolvedBlockingIssues(fullIssue);
 			return {
-				blocked: true,
-				blockingIssueIds: unresolvedBlockers.map((b) => b.id),
-				blockingIdentifiers: unresolvedBlockers.map((b) => b.identifier),
+				blocked: blockers.length > 0,
+				blockingIssueIds: blockers.map((blocker) => blocker.id),
+				blockingIdentifiers: blockers.map((blocker) => blocker.identifier),
 			};
 		} catch (error) {
 			this.logger.error(
 				`Failed to check blocked-by dependencies for ${issue.identifier}:`,
 				error,
 			);
-			// On error, don't block — proceed with normal flow
-			return { blocked: false, blockingIssueIds: [], blockingIdentifiers: [] };
+			// Keep the request until an authoritative check succeeds.
+			return { blocked: true, blockingIssueIds: [], blockingIdentifiers: [] };
 		}
 	}
 
-	/**
-	 * Handle issue state change webhooks.
-	 * When a blocking issue is completed, wake up any parked sessions that were waiting on it.
-	 */
-	private async handleIssueStateChange(
-		webhook: IssueUpdateWebhook,
-	): Promise<void> {
-		const issueData = webhook.data;
-		const completedIssueId = issueData.id;
-		const issueIdentifier = issueData.identifier;
-
-		// Only care about transitions TO completed or canceled states
-		// The IssueWebhookPayload has a stateId field — resolve the state
-		// via the issue tracker to check if it's a completion state
-		const stateId = issueData.stateId;
-		if (!stateId) {
-			return;
-		}
-
-		// Find workspace for this webhook to resolve state type
-		const linearWorkspaceId = webhook.organizationId;
-		const issueTracker = this.issueTrackers.get(linearWorkspaceId);
-		if (!issueTracker) {
-			return;
-		}
-
-		// Fetch the issue to check its current state type
-		let stateType: string | undefined;
-		try {
-			const fullIssue = await issueTracker.fetchIssue(completedIssueId);
-			const state = await fullIssue.state;
-			stateType = state?.type;
-		} catch {
-			// Can't resolve state — skip
-			return;
-		}
-
-		if (stateType !== "completed" && stateType !== "canceled") {
-			return;
-		}
-
-		this.logger.debug(
-			`Issue ${issueIdentifier} moved to ${stateType} — checking for parked sessions to wake`,
-		);
-
-		// Find parked sessions that were blocked by this issue
-		const sessionsToWake: string[] = [];
-		for (const [blockedIssueId, parked] of this.parkedSessions.entries()) {
-			if (parked.blockingIssueIds.includes(completedIssueId)) {
-				// Remove this blocker from the list
-				parked.blockingIssueIds = parked.blockingIssueIds.filter(
-					(id) => id !== completedIssueId,
-				);
-
-				// If no more blockers, wake the session
-				if (parked.blockingIssueIds.length === 0) {
-					sessionsToWake.push(blockedIssueId);
-				} else {
-					this.logger.debug(
-						`Parked session for issue ${blockedIssueId} still has ${parked.blockingIssueIds.length} remaining blocker(s)`,
-					);
+	private async fetchUnresolvedBlockingIssues(
+		issue: Issue,
+	): Promise<Array<{ id: string; identifier: string }>> {
+		const blockers: Array<{ id: string; identifier: string }> = [];
+		const cursors = new Set<string>();
+		let after: string | undefined;
+		do {
+			const relations = await issue.inverseRelations({ first: 100, after });
+			if (!Array.isArray(relations?.nodes))
+				throw new Error("Dependencies could not be confirmed");
+			for (const relation of relations.nodes) {
+				if (relation.type !== "blocks") continue;
+				const blocker = await relation.issue;
+				const state = await blocker?.state;
+				if (!blocker || !state)
+					throw new Error("Dependency state could not be confirmed");
+				if (state.type !== "completed" && state.type !== "canceled") {
+					blockers.push({ id: blocker.id, identifier: blocker.identifier });
 				}
 			}
-		}
-
-		// Wake up unblocked sessions
-		for (const blockedIssueId of sessionsToWake) {
-			const parked = this.parkedSessions.get(blockedIssueId);
-			if (!parked) continue;
-
-			this.parkedSessions.delete(blockedIssueId);
-
-			this.logger.info(
-				`Waking parked session for issue ${parked.agentSession.issue?.identifier} — all blockers resolved`,
-			);
-
-			// Post activity about waking up
-			await this.activityPoster.postThoughtActivity(
-				parked.agentSession.id,
-				parked.linearWorkspaceId,
-				`All blocking dependencies are now resolved — starting work.`,
-			);
-
-			// Replay the normal initializeAgentRunner flow
-			try {
-				await this.initializeAgentRunner(
-					parked.agentSession,
-					parked.repositories,
-					parked.linearWorkspaceId,
-					parked.guidance,
-					parked.commentBody,
-					parked.baseBranchOverrides,
-					parked.routingMethod,
-				);
-			} catch (error) {
-				this.logger.error(
-					`Failed to wake parked session for issue ${blockedIssueId}:`,
-					error,
-				);
+			const next = relations.pageInfo?.hasNextPage
+				? relations.pageInfo.endCursor
+				: undefined;
+			if (relations.pageInfo?.hasNextPage && (!next || cursors.has(next))) {
+				throw new Error("Dependency pagination could not be completed");
 			}
+			if (next) cursors.add(next);
+			after = next ?? undefined;
+		} while (after);
+		return blockers;
+	}
+
+	/** Reconcile missed dependency events after restart and transient tracker errors. */
+	private async reconcileParkedSessions(): Promise<void> {
+		for (const issueId of this.parkedSessions.keys()) {
+			if (this.stopping) return;
+			await this.wakeParkedSession(issueId);
 		}
 	}
 
-	/**
-	 * Handle a user re-prompt on a parked (blocked-by) session.
-	 * Re-checks blocking status: if clear, wakes the session; if still blocked, re-posts status.
-	 */
-	private async handleParkedSessionReprompt(
-		_webhook: AgentSessionPromptedWebhook,
-		issueId: string,
-	): Promise<void> {
+	private async cancelParkedSession(issueId: string): Promise<void> {
 		const parked = this.parkedSessions.get(issueId);
 		if (!parked) return;
+		if (this.wakingParkedSessions.has(issueId)) {
+			this.canceledParkedStarts.add(parked.agentSession.id);
+		}
+		this.parkedSessions.delete(issueId);
+		await this.savePersistedState(true);
+	}
 
-		const blockResult = await this.checkBlockedByDependencies(
-			parked.agentSession,
-			parked.linearWorkspaceId,
+	private async fetchOpenParkedIssue(
+		issueId: string,
+		parked: NonNullable<ReturnType<typeof this.parkedSessions.get>>,
+	): Promise<Issue | undefined> {
+		const issueTracker = this.issueTrackers.get(parked.linearWorkspaceId);
+		if (!issueTracker) return;
+		const issue = await issueTracker.fetchIssue(issueId);
+		const state = await issue.state;
+		if (!state?.type) throw new Error("Issue state could not be confirmed");
+		const remoteSession = await issueTracker.fetchAgentSession(
+			parked.agentSession.id,
 		);
-
-		if (blockResult.blocked) {
-			// Still blocked — update the parked entry and re-post status
-			parked.blockingIssueIds = blockResult.blockingIssueIds;
-			const blockerList = blockResult.blockingIdentifiers
-				.map((id) => `**${id}**`)
-				.join(", ");
-			await this.activityPoster.postThoughtActivity(
-				parked.agentSession.id,
-				parked.linearWorkspaceId,
-				`Still blocked by ${blockerList}. Will start automatically when resolved.`,
-			);
-			this.logger.info(
-				`Re-prompt on parked session for ${parked.agentSession.issue?.identifier}: still blocked by ${blockResult.blockingIdentifiers.join(", ")}`,
-			);
+		if (!remoteSession?.status)
+			throw new Error("Agent session state could not be confirmed");
+		if (
+			issue.archivedAt ||
+			state.type === "completed" ||
+			state.type === "canceled" ||
+			remoteSession.archivedAt ||
+			remoteSession.endedAt ||
+			remoteSession.status === "complete" ||
+			remoteSession.status === "error"
+		) {
+			await this.cancelParkedSession(issueId);
 			return;
 		}
+		return issue;
+	}
 
-		// Blockers resolved — wake the session
-		this.parkedSessions.delete(issueId);
-		this.logger.info(
-			`Re-prompt cleared blockers for ${parked.agentSession.issue?.identifier} — waking session`,
-		);
+	/**
+	 * Recheck authoritative issue, session, and dependency state before starting.
+	 * An API failure keeps the record parked. A persisted start claim requires
+	 * an explicit prompt after a crash because execution may already have begun.
+	 */
+	private async wakeParkedSession(
+		issueId: string,
+		notifyIfBlocked = false,
+		resumeWebhook?: AgentSessionPromptedWebhook,
+	): Promise<void> {
+		const parked = this.parkedSessions.get(issueId);
+		if (!parked || this.stopping || this.wakingParkedSessions.has(issueId))
+			return;
 
-		await this.activityPoster.postThoughtActivity(
-			parked.agentSession.id,
-			parked.linearWorkspaceId,
-			`Blocking dependencies are now resolved — starting work.`,
-		);
-
+		this.wakingParkedSessions.add(issueId);
 		try {
+			const fullIssue = await this.fetchOpenParkedIssue(issueId, parked);
+			if (!fullIssue || (parked.phase === "starting" && !resumeWebhook)) return;
+
+			const blockingIssueIds = (
+				await this.fetchUnresolvedBlockingIssues(fullIssue)
+			).map((blocker) => blocker.id);
+
+			// A stop or unassignment can arrive during any of the tracker requests.
+			if (this.parkedSessions.get(issueId) !== parked || this.stopping) return;
+			parked.blockingIssueIds = blockingIssueIds;
+			if (blockingIssueIds.length > 0) {
+				await this.savePersistedState(true);
+				if (notifyIfBlocked) {
+					await this.activityPoster.postThoughtActivity(
+						parked.agentSession.id,
+						parked.linearWorkspaceId,
+						"Still waiting for blocking dependencies. Work will start when they are resolved.",
+					);
+				}
+				return;
+			}
+
+			// Resolve current configuration rather than replaying stale repository credentials.
+			const repositories = (
+				parked.repositoryIds ?? parked.repositories.map((repo) => repo.id)
+			).map((id) => this.repositories.get(id));
+			if (
+				repositories.some(
+					(repo) =>
+						!repo ||
+						repo.isActive === false ||
+						repo.linearWorkspaceId !== parked.linearWorkspaceId,
+				)
+			) {
+				throw new Error("A parked session repository is missing or inactive");
+			}
+			if (this.agentSessionManager.getSession(parked.agentSession.id)) {
+				// A session already claimed this ID before the parked record was removed.
+				await this.cancelParkedSession(issueId);
+				if (resumeWebhook) {
+					await this.handleNormalPromptedActivity(
+						resumeWebhook,
+						repositories as RepositoryConfig[],
+					);
+				}
+				return;
+			}
+
+			parked.phase = "starting";
+			await this.savePersistedState(true);
+			if (this.parkedSessions.get(issueId) !== parked || this.stopping) return;
 			await this.initializeAgentRunner(
 				parked.agentSession,
-				parked.repositories,
+				repositories as RepositoryConfig[],
 				parked.linearWorkspaceId,
 				parked.guidance,
 				parked.commentBody,
 				parked.baseBranchOverrides,
 				parked.routingMethod,
 			);
+			if (this.parkedSessions.get(issueId) === parked) {
+				this.parkedSessions.delete(issueId);
+				await this.savePersistedState(true);
+			}
 		} catch (error) {
-			this.logger.error(
-				`Failed to wake parked session for issue ${issueId} on re-prompt:`,
-				error,
-			);
+			this.logger.error(`Could not resume parked issue ${issueId}:`, error);
+		} finally {
+			this.wakingParkedSessions.delete(issueId);
+			this.canceledParkedStarts.delete(parked.agentSession.id);
 		}
+	}
+
+	private async handleIssueStateChange(
+		webhook: IssueUpdateWebhook,
+	): Promise<void> {
+		if (!webhook.data.stateId) return;
+		for (const [issueId, parked] of this.parkedSessions) {
+			if (
+				parked.linearWorkspaceId === webhook.organizationId &&
+				(issueId === webhook.data.id ||
+					parked.blockingIssueIds.includes(webhook.data.id))
+			) {
+				await this.wakeParkedSession(issueId);
+			}
+		}
+	}
+
+	private async handleParkedSessionReprompt(
+		webhook: AgentSessionPromptedWebhook,
+		issueId: string,
+	): Promise<void> {
+		const parked = this.parkedSessions.get(issueId);
+		if (!parked || parked.agentSession.id !== webhook.agentSession.id) return;
+		await this.wakeParkedSession(issueId, true, webhook);
 	}
 
 	private buildIssueUpdatePrompt(
@@ -4662,6 +4655,14 @@ ${taskSection}`;
 		repos: RepositoryConfig[],
 	): Promise<void> {
 		const issueId = webhook.agentSession?.issue?.id;
+		if (
+			issueId &&
+			this.parkedSessions.get(issueId)?.agentSession.id ===
+				webhook.agentSession.id
+		) {
+			// An at-least-once delivery must not erase a durable start claim.
+			return;
+		}
 
 		// Check the cache first, as the agentSessionCreated webhook may have been triggered by an @mention
 		// on an issue that already has an agentSession and an associated repository.
@@ -4784,7 +4785,9 @@ ${taskSection}`;
 				baseBranchOverrides,
 				routingMethod,
 				blockingIssueIds: blockResult.blockingIssueIds,
+				phase: "waiting",
 			});
+			await this.savePersistedState(true);
 
 			// Post acknowledgment to the Linear agent session
 			const blockerList = blockResult.blockingIdentifiers
@@ -4793,7 +4796,9 @@ ${taskSection}`;
 			await this.activityPoster.postThoughtActivity(
 				agentSession.id,
 				linearWorkspaceId,
-				`Blocked by ${blockerList} — will start automatically when ${blockResult.blockingIdentifiers.length === 1 ? "it is" : "they are"} resolved.`,
+				blockerList
+					? `Blocked by ${blockerList}. Work will start when ${blockResult.blockingIdentifiers.length === 1 ? "it is" : "they are"} resolved.`
+					: "Dependency status is unavailable. Work will start after Cyrus confirms the issue is unblocked.",
 			);
 
 			log.info(
@@ -4879,38 +4884,38 @@ ${taskSection}`;
 
 		const agentSessionManager = this.agentSessionManager;
 
-		// Post instant acknowledgment thought
-		await this.postInstantAcknowledgment(sessionId, linearWorkspaceId);
-
-		// Create the session using the shared method (pass full repositories array)
-		const sessionData = await this.createCyrusAgentSession(
-			sessionId,
-			issue,
-			repositories,
-			agentSessionManager,
-			linearWorkspaceId,
-			baseBranchOverrides,
-			routingMethod,
-		);
-
-		// Destructure the session data (excluding allowedTools which we'll build with promptType)
-		const {
-			session,
-			fullIssue,
-			workspace: _workspace,
-			attachmentResult,
-			attachmentsDir: _attachmentsDir,
-			allowedDirectories,
-		} = sessionData;
-
-		// Fetch labels early (needed for system prompt and runner selection)
-		const labels = await this.fetchIssueLabels(fullIssue);
-
-		log.info(`Starting agent session for issue ${fullIssue.identifier}`);
-
-		// Build and start Claude with initial prompt using full issue (streaming mode)
-		log.info(`Building initial prompt for issue ${fullIssue.identifier}`);
 		try {
+			// Post instant acknowledgment thought
+			await this.postInstantAcknowledgment(sessionId, linearWorkspaceId);
+
+			// Create the session using the shared method (pass full repositories array)
+			const sessionData = await this.createCyrusAgentSession(
+				sessionId,
+				issue,
+				repositories,
+				agentSessionManager,
+				linearWorkspaceId,
+				baseBranchOverrides,
+				routingMethod,
+			);
+
+			// Destructure the session data (excluding allowedTools which we'll build with promptType)
+			const {
+				session,
+				fullIssue,
+				workspace: _workspace,
+				attachmentResult,
+				attachmentsDir: _attachmentsDir,
+				allowedDirectories,
+			} = sessionData;
+
+			// Fetch labels early (needed for system prompt and runner selection)
+			const labels = await this.fetchIssueLabels(fullIssue);
+
+			log.info(`Starting agent session for issue ${fullIssue.identifier}`);
+
+			// Build and start Claude with initial prompt using full issue (streaming mode)
+			log.info(`Building initial prompt for issue ${fullIssue.identifier}`);
 			// Create input for unified prompt assembly
 			const input: PromptAssemblyInput = {
 				session,
@@ -5003,6 +5008,12 @@ ${taskSection}`;
 				`Label-based runner selection for new session: ${runnerType} (session ${sessionId})`,
 			);
 
+			if (this.canceledParkedStarts.has(sessionId) || this.stopping) {
+				agentSessionManager.requestSessionStop(sessionId);
+				await this.savePersistedState(true);
+				return;
+			}
+
 			const runner = this.createRunnerForType(runnerType, runnerConfig);
 
 			// Store runner by comment ID
@@ -5050,8 +5061,57 @@ ${taskSection}`;
 			// is received via handleClaudeMessage() callback
 		} catch (error) {
 			log.error(`Error in prompt building/starting:`, error);
+			try {
+				await this.reportSessionStartFailure(sessionId, linearWorkspaceId);
+			} catch (reportError) {
+				log.error(
+					"Could not persist or publish the session startup failure:",
+					reportError,
+				);
+			}
 			throw error;
 		}
+	}
+
+	private async reportSessionStartFailure(
+		sessionId: string,
+		linearWorkspaceId: string,
+	): Promise<void> {
+		const session = this.agentSessionManager.getSession(sessionId);
+		if (
+			session?.status === AgentSessionStatus.Complete ||
+			session?.status === AgentSessionStatus.Error
+		)
+			return;
+		if (session) {
+			session.status = AgentSessionStatus.Error;
+			session.updatedAt = Date.now();
+		}
+		// Exception details can contain paths, credentials or upstream response data.
+		// Publish fixed guidance and retain those details only in the local log.
+		const issueTracker = this.issueTrackers.get(linearWorkspaceId);
+		if (issueTracker) {
+			await this.postActivityDirect(
+				issueTracker,
+				{
+					agentSessionId: sessionId,
+					content: {
+						type: "error",
+						body: "Cyrus could not start this session. Check the selected provider, its account, and the local configuration. Correct the problem before sending another prompt. Details are in the local Cyrus log.",
+					},
+				},
+				"session startup failure",
+			);
+			// Linear derives this state from the error activity. The CLI tracker
+			// exposes an explicit status setter for its in-memory session fixture.
+			if (issueTracker instanceof CLIIssueTrackerService) {
+				await issueTracker.updateAgentSessionStatus(
+					sessionId,
+					AgentSessionStatus.Error,
+				);
+			}
+		}
+		await this.savePersistedState(true);
 	}
 
 	/**
@@ -5068,6 +5128,12 @@ ${taskSection}`;
 		const agentSessionId = webhook.agentSession.id;
 		const { issue } = webhook.agentSession;
 		const log = this.logger.withContext({ sessionId: agentSessionId });
+		if (
+			issue &&
+			this.parkedSessions.get(issue.id)?.agentSession.id === agentSessionId
+		) {
+			await this.cancelParkedSession(issue.id);
+		}
 
 		log.info(
 			`Received stop signal for agent activity session ${agentSessionId}`,
@@ -5505,7 +5571,9 @@ ${taskSection}`;
 		const issueIdForParkedCheck = webhook.agentSession?.issue?.id;
 		if (
 			issueIdForParkedCheck &&
-			this.parkedSessions.has(issueIdForParkedCheck)
+			this.parkedSessions.get(issueIdForParkedCheck)?.agentSession.id ===
+				agentSessionId &&
+			!this.agentSessionManager.getSession(agentSessionId)?.agentRunner
 		) {
 			await this.handleParkedSessionReprompt(webhook, issueIdForParkedCheck);
 			return;
@@ -5787,8 +5855,20 @@ ${taskSection}`;
 		runnerType: RunnerType,
 		config: AgentRunnerConfig,
 	): IAgentRunner {
+		this.runnerSelectionService.assertRunnerAllowed(
+			runnerType,
+			"runner creation",
+		);
 		return capRunnerStarts(
-			this.buildRunnerForType(runnerType, config),
+			this.buildRunnerForType(
+				runnerType,
+				runnerType === "cursor"
+					? {
+							...config,
+							...this.runnerSelectionService.getCursorConfig(),
+						}
+					: config,
+			),
 			this.runnerSlots,
 		);
 	}
@@ -7264,6 +7344,11 @@ ${input.userComment}
 	 * `CYRUS_ENABLE_WARM_SESSIONS=1` (or `=true`).
 	 */
 	private isWarmSessionsEnabled(): boolean {
+		if (
+			this.config.allowedRunners &&
+			!this.config.allowedRunners.includes("claude")
+		)
+			return false;
 		const raw = process.env.CYRUS_ENABLE_WARM_SESSIONS;
 		if (!raw) return false;
 		const v = raw.toLowerCase().trim();
@@ -7419,7 +7504,7 @@ ${input.userComment}
 	/**
 	 * Save current EdgeWorker state for all repositories
 	 */
-	private async savePersistedState(): Promise<void> {
+	private async savePersistedState(throwOnError = false): Promise<void> {
 		try {
 			const state = this.serializeMappings();
 			await this.persistenceManager.saveEdgeWorkerState(state);
@@ -7428,6 +7513,7 @@ ${input.userComment}
 			);
 		} catch (error) {
 			this.logger.error(`Failed to save persisted EdgeWorker state:`, error);
+			if (throwOnError) throw error;
 		}
 	}
 
@@ -7452,6 +7538,26 @@ ${input.userComment}
 			agentSessionEntries: serializedState.entries,
 			childToParentAgentSession,
 			issueRepositoryCache,
+			parkedSessions: Object.fromEntries(
+				Array.from(this.parkedSessions, ([issueId, parked]) => {
+					const {
+						repositories,
+						repositoryIds,
+						baseBranchOverrides,
+						...context
+					} = parked;
+					return [
+						issueId,
+						{
+							...context,
+							repositoryIds:
+								repositoryIds ?? repositories.map((repo) => repo.id),
+							baseBranchOverrides:
+								baseBranchOverrides && Object.fromEntries(baseBranchOverrides),
+						},
+					];
+				}),
+			),
 		};
 	}
 
@@ -7459,6 +7565,52 @@ ${input.userComment}
 	 * Restore EdgeWorker mappings from serialized state (v4.0 flat format)
 	 */
 	public restoreMappings(state: SerializableEdgeWorkerState): void {
+		for (const [issueId, parked] of Object.entries(
+			state.parkedSessions ?? {},
+		)) {
+			if (
+				!parked ||
+				parked.agentSession?.issue?.id !== issueId ||
+				typeof parked.agentSession.id !== "string" ||
+				typeof parked.linearWorkspaceId !== "string" ||
+				!Array.isArray(parked.repositoryIds) ||
+				parked.repositoryIds.length === 0 ||
+				!parked.repositoryIds.every((id) => typeof id === "string") ||
+				(parked.phase !== undefined &&
+					parked.phase !== "waiting" &&
+					parked.phase !== "starting") ||
+				!Array.isArray(parked.blockingIssueIds) ||
+				!parked.blockingIssueIds.every((id) => typeof id === "string")
+			) {
+				this.logger.warn(
+					`Ignoring invalid parked session for issue ${issueId}`,
+				);
+				continue;
+			}
+			const repositories = parked.repositoryIds.map((id) =>
+				this.repositories.get(id),
+			);
+			if (
+				repositories.some(
+					(repo) => repo && repo.linearWorkspaceId !== parked.linearWorkspaceId,
+				)
+			) {
+				this.logger.warn(
+					`Cannot restore parked issue ${issueId}: repository belongs to another workspace`,
+				);
+				continue;
+			}
+			const { baseBranchOverrides, ...context } = parked;
+			this.parkedSessions.set(issueId, {
+				...context,
+				phase: parked.phase === "starting" ? "starting" : "waiting",
+				repositories: repositories.filter((repo): repo is RepositoryConfig =>
+					Boolean(repo),
+				),
+				baseBranchOverrides:
+					baseBranchOverrides && new Map(Object.entries(baseBranchOverrides)),
+			});
+		}
 		// Restore Agent Session state from flat format
 		if (state.agentSessions && state.agentSessionEntries) {
 			this.agentSessionManager.restoreState(

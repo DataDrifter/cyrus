@@ -40,6 +40,12 @@ const RELOAD_MERGED_KEYS = [
 	"codexSandboxMode",
 	"cursorDefaultModel",
 	"cursorDefaultFallbackModel",
+	"cursorTeamId",
+	"cursorAccountEmail",
+	"cursorSettingSources",
+	"workspaceSupportPaths",
+	"allowedRunners",
+	"publicationPolicy",
 	"opencodeDefaultModel",
 	"opencodeDefaultFallbackModel",
 	"opencode",
@@ -321,6 +327,12 @@ export class ConfigManager extends EventEmitter {
 					parsedConfig.codexDefaultModel || this.config.codexDefaultModel,
 				// Removing an explicit mode restores the runner's sandboxed default.
 				codexSandboxMode: parsedConfig.codexSandboxMode,
+				cursorTeamId: parsedConfig.cursorTeamId,
+				cursorAccountEmail: parsedConfig.cursorAccountEmail,
+				cursorSettingSources: parsedConfig.cursorSettingSources,
+				workspaceSupportPaths: parsedConfig.workspaceSupportPaths,
+				allowedRunners: parsedConfig.allowedRunners,
+				publicationPolicy: parsedConfig.publicationPolicy,
 				cursorDefaultModel:
 					parsedConfig.cursorDefaultModel || this.config.cursorDefaultModel,
 				cursorDefaultFallbackModel:

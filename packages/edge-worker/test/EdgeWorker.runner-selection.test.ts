@@ -102,6 +102,7 @@ describe("EdgeWorker - Runner Selection Based on Labels", () => {
 			branchName: "test-branch",
 			state: { name: "Todo" },
 			team: { id: "team-123" },
+			inverseRelations: vi.fn().mockResolvedValue({ nodes: [] }),
 			labels: vi.fn().mockResolvedValue({
 				nodes: labels.map((name) => ({ name })),
 			}),

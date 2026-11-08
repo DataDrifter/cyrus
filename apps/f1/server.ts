@@ -26,7 +26,9 @@ import {
 	type EdgeWorkerConfig,
 	getDefaultReposDir,
 	getDefaultWorktreesDir,
+	PublicationPolicySchema,
 	type RepositoryConfig,
+	RunnerTypeSchema,
 } from "cyrus-core";
 import { EdgeWorker } from "cyrus-edge-worker";
 import type { SlackWebhookEvent } from "cyrus-slack-event-transport";
@@ -167,11 +169,18 @@ function createEdgeWorkerConfig(): EdgeWorkerConfig {
 		// Env-gated runner selection for harness validation (default unchanged).
 		// e.g. CYRUS_DEFAULT_RUNNER=codex to exercise the Codex (app-server) path.
 		...(process.env.CYRUS_DEFAULT_RUNNER && {
-			defaultRunner: process.env.CYRUS_DEFAULT_RUNNER as
-				| "claude"
-				| "gemini"
-				| "codex"
-				| "cursor",
+			defaultRunner: RunnerTypeSchema.parse(process.env.CYRUS_DEFAULT_RUNNER),
+		}),
+		...(process.env.CYRUS_ALLOWED_RUNNERS && {
+			allowedRunners: process.env.CYRUS_ALLOWED_RUNNERS.split(",").map(
+				(value) => RunnerTypeSchema.parse(value.trim()),
+			),
+		}),
+		...(process.env.CYRUS_PUBLICATION_MODE && {
+			publicationPolicy: PublicationPolicySchema.parse({
+				mode: process.env.CYRUS_PUBLICATION_MODE,
+				repositoryUrl: process.env.CYRUS_PUBLISH_REPOSITORY_URL,
+			}),
 		}),
 		codexDefaultModel: process.env.CODEX_MODEL || "gpt-5.5",
 		// Enable all tools including Edit(**), Bash, etc. for full testing capability

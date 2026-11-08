@@ -144,3 +144,70 @@ describe("RunnerSelectionService", () => {
 		expect(selection.modelOverride).toBe("sonnet");
 	});
 });
+
+describe("RunnerSelectionService provider restrictions", () => {
+	it("instructs native children to stay on the selected account and denies excluded provider commands", () => {
+		const service = new RunnerSelectionService({
+			repositories: [],
+			allowedRunners: ["cursor"],
+		});
+		const policy = service.getRunnerPolicy();
+		expect(policy.guidance).toContain(
+			"same Cursor account and configured team",
+		);
+		expect(policy.guidance).toContain(
+			"parents, children, model fallbacks, and resumed sessions",
+		);
+		expect(policy.disallowedTools).toContain("Bash(claude:*)");
+		expect(policy.disallowedTools).toContain("Bash(*/codex:*)");
+		expect(policy.disallowedTools).not.toContain("Bash(agent:*)");
+	});
+	it("keeps model-only Claude and OpenAI selections inside Cursor", () => {
+		const service = new RunnerSelectionService({
+			allowedRunners: ["cursor"],
+			cursorDefaultFallbackModel: "composer-2",
+		} as EdgeWorkerConfig);
+		for (const model of ["sonnet", "claude-sonnet-4.5", "gpt-5.5"]) {
+			expect(service.determineRunnerSelection([], `[model=${model}]`)).toEqual({
+				runnerType: "cursor",
+				modelOverride: model,
+				fallbackModelOverride: "composer-2",
+			});
+		}
+		expect(service.determineRunnerSelection(["sonnet"]).runnerType).toBe(
+			"cursor",
+		);
+	});
+
+	it("rejects an explicitly forbidden provider and an incompatible configured default", () => {
+		const service = new RunnerSelectionService({
+			allowedRunners: ["cursor"],
+		} as EdgeWorkerConfig);
+		expect(() =>
+			service.determineRunnerSelection([], "[agent=claude]"),
+		).toThrow("not permitted");
+		expect(() => service.determineRunnerSelection(["codex/gpt-5.5"])).toThrow(
+			"not permitted",
+		);
+		expect(() =>
+			service.assertRunnerAllowed("claude", "resumed session"),
+		).toThrow("resumed session");
+		service.setConfig({
+			allowedRunners: ["cursor"],
+			defaultRunner: "claude",
+		} as EdgeWorkerConfig);
+		expect(() => service.getDefaultRunner()).toThrow("configured default");
+	});
+
+	it("retains Claude models when Cursor is explicitly selected", () => {
+		const service = new RunnerSelectionService({
+			defaultRunner: "cursor",
+		} as EdgeWorkerConfig);
+		expect(
+			service.determineRunnerSelection(
+				[],
+				"[agent=cursor] [model=claude-sonnet-4.5]",
+			).modelOverride,
+		).toBe("claude-sonnet-4.5");
+	});
+});

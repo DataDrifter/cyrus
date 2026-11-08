@@ -88,6 +88,7 @@ describe("EdgeWorker - Parent Branch Handling", () => {
 				branchName: "test-branch",
 				state: Promise.resolve({ name: "Todo" }),
 				team: { id: "team-123" },
+				inverseRelations: vi.fn().mockResolvedValue({ nodes: [] }),
 				labels: vi.fn().mockResolvedValue({
 					nodes: [],
 				}),
@@ -268,6 +269,7 @@ Base Branch: {{base_branch}}`;
 			branchName: "test-branch",
 			state: Promise.resolve({ name: "Todo" }),
 			team: { id: "team-123" },
+			inverseRelations: vi.fn().mockResolvedValue({ nodes: [] }),
 			labels: vi.fn().mockResolvedValue({
 				nodes: [],
 			}),
@@ -321,6 +323,7 @@ Base Branch: {{base_branch}}`;
 			branchName: "test-branch",
 			state: Promise.resolve({ name: "Todo" }),
 			team: { id: "team-123" },
+			inverseRelations: vi.fn().mockResolvedValue({ nodes: [] }),
 			labels: vi.fn().mockResolvedValue({
 				nodes: [],
 			}),
@@ -375,6 +378,7 @@ Base Branch: {{base_branch}}`;
 			branchName: "test-branch",
 			state: Promise.resolve({ name: "Todo" }),
 			team: { id: "team-123" },
+			inverseRelations: vi.fn().mockResolvedValue({ nodes: [] }),
 			labels: vi.fn().mockResolvedValue({
 				nodes: [],
 			}),

@@ -1,3 +1,4 @@
+import type { ToolName } from "@cursor/sdk";
 import type {
 	AgentRunnerConfig,
 	AgentSessionInfo,
@@ -6,6 +7,22 @@ import type {
 import type { CursorSandboxInput } from "./sandbox.js";
 
 export interface CursorRunnerConfig extends AgentRunnerConfig {
+	/** SDK-native tool restrictions used by lightweight read-only queries. */
+	cursorTools?: ToolName[];
+	cursorDisallowedTools?: ToolName[];
+
+	/** Workflow guidance prepended to the request, preserving Cursor's built-in harness. */
+	systemPrompt?: string;
+
+	/** Team attributed to create and resume calls. Must be a positive safe integer. */
+	cursorTeamId?: number;
+
+	/** Verified through Cursor.me before create or resume when configured. */
+	cursorAccountEmail?: string;
+
+	/** Additional settings sources. Project settings always load for permission hooks. */
+	cursorSettingSources?: Array<"user" | "project">;
+
 	/** API key for Cursor SDK authentication (falls back to CURSOR_API_KEY env). */
 	cursorApiKey?: string;
 

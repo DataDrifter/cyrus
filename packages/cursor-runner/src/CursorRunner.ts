@@ -1,19 +1,16 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
-	chmodSync,
-	copyFileSync,
 	createWriteStream,
 	existsSync,
 	mkdirSync,
-	renameSync,
-	unlinkSync,
+	readFileSync,
 	type WriteStream,
-	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { cwd } from "node:process";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import type {
 	McpServerConfig as CursorMcpServerConfig,
 	SDKAssistantMessage as CursorSDKAssistantMessage,
@@ -26,12 +23,6 @@ import type {
 	Run,
 	SDKAgent,
 } from "@cursor/sdk";
-// `@cursor/sdk` is loaded lazily inside `start()` rather than at module top
-// level. Its native/runtime dependencies can fail at import time on unsupported
-// Node versions or when a compatible SQLite binding is unavailable. Lazy-loading
-// lets edge-worker tests that mock the cursor runner load on every supported
-// Node version, and only pays the import cost when a Cursor session actually
-// starts.
 import type {
 	IAgentRunner,
 	IMessageFormatter,
@@ -40,11 +31,20 @@ import type {
 	SDKResultMessage,
 	SDKUserMessage,
 } from "cyrus-core";
+// `@cursor/sdk` is loaded lazily inside `start()` rather than at module top
+// level. Its native/runtime dependencies can fail at import time on unsupported
+// Node versions or when a compatible SQLite binding is unavailable. Lazy-loading
+// lets edge-worker tests that mock the cursor runner load on every supported
+// Node version, and only pays the import cost when a Cursor session actually
+// starts.
+import { ManagedSkillStager, WorkspaceSupportStager } from "cyrus-core";
 import { CursorMessageFormatter } from "./formatter.js";
 import {
 	buildCyrusPermissionsConfig,
 	type CyrusPermissionsConfig,
 } from "./permissions.js";
+import { ProjectPermissionHooks } from "./project-hooks.js";
+import { buildCursorPrompt, loadCursorMcpConfig } from "./runtime-config.js";
 import { buildCursorSandboxJson, buildSandboxEnv } from "./sandbox.js";
 import type {
 	CursorRunnerConfig,
@@ -58,16 +58,6 @@ type SDKSystemInitMessage = Extract<
 	SDKMessage,
 	{ type: "system"; subtype: "init" }
 >;
-
-interface CursorHooksRestoreState {
-	hooksPath: string;
-	backupPath: string | null;
-}
-
-interface CursorSandboxRestoreState {
-	sandboxPath: string;
-	backupPath: string | null;
-}
 
 function safeStringify(value: unknown): string {
 	try {
@@ -215,7 +205,11 @@ function mapCyrusMcpToSdk(
 	if (!mcpConfig) return servers;
 
 	for (const [name, raw] of Object.entries(mcpConfig)) {
+		if (!raw || typeof raw !== "object") {
+			throw new Error(`Invalid Cursor MCP server '${name}'`);
+		}
 		const cfg = raw as Record<string, unknown>;
+		if (cfg.disabled === true) continue;
 		if (
 			typeof cfg.listTools === "function" ||
 			typeof cfg.callTool === "function"
@@ -400,6 +394,8 @@ export declare interface CursorRunner {
 }
 
 export class CursorRunner extends EventEmitter implements IAgentRunner {
+	private static activeRunners = new Set<CursorRunner>();
+	private static sandboxEnvironmentOwner: CursorRunner | null = null;
 	readonly supportsStreamingInput = false;
 
 	private config: CursorRunnerConfig;
@@ -423,10 +419,13 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 	private errorMessages: string[] = [];
 	private emittedToolUseIds = new Set<string>();
 	private logStream: WriteStream | null = null;
-	private hooksRestoreState: CursorHooksRestoreState | null = null;
-	private sandboxRestoreState: CursorSandboxRestoreState | null = null;
-	private sandboxEnvRestoreState: Map<string, string | undefined> | null = null;
-	private permissionsArtifactsInstalled = false;
+	private permissionHooks: ProjectPermissionHooks | null = null;
+	private managedSkills: ManagedSkillStager | null = null;
+	private workspaceSupport: WorkspaceSupportStager | null = null;
+	private sandboxEnvRestoreState: Map<
+		string,
+		{ previous: string | undefined; installed: string }
+	> | null = null;
 
 	constructor(config: CursorRunnerConfig) {
 		super();
@@ -439,7 +438,7 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 	}
 
 	async start(prompt: string): Promise<CursorSessionInfo> {
-		if (this.isRunning()) {
+		if (this.isRunning() || CursorRunner.activeRunners.has(this)) {
 			throw new Error("Cursor session already running");
 		}
 
@@ -472,7 +471,36 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 			null;
 
 		try {
-			this.installPermissionsArtifacts(workspace);
+			if (CursorRunner.sandboxEnvironmentOwner) {
+				throw new Error(
+					"A Cursor session is using process-wide sandbox environment settings. Wait for it to finish.",
+				);
+			}
+			CursorRunner.activeRunners.add(this);
+			if (
+				this.config.cursorTeamId !== undefined &&
+				(!Number.isSafeInteger(this.config.cursorTeamId) ||
+					this.config.cursorTeamId <= 0)
+			) {
+				throw new Error("cursorTeamId must be a positive safe integer");
+			}
+			const mcpServers = mapCyrusMcpToSdk(
+				loadCursorMcpConfig(this.config, workspace),
+			);
+			this.installPermissionsArtifacts(workspace, mcpServers);
+			this.workspaceSupport = new WorkspaceSupportStager({
+				workingDirectory: workspace,
+				workspaceSupportSource: this.config.workspaceSupportSource,
+				workspaceSupportPaths: this.config.workspaceSupportPaths,
+			});
+			this.workspaceSupport.stage();
+			this.managedSkills = new ManagedSkillStager({
+				workingDirectory: workspace,
+				additionalDirectories: this.config.additionalDirectories,
+				plugins: this.config.plugins,
+				skills: this.config.skills,
+			});
+			this.managedSkills.stage();
 
 			// Test/CI fallback for environments where the SDK can't run.
 			if (process.env.CYRUS_CURSOR_MOCK === "1") {
@@ -485,19 +513,58 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 				return this.sessionInfo;
 			}
 
-			const apiKey = this.config.cursorApiKey ?? process.env.CURSOR_API_KEY;
+			const { loadCyrusCursorApiKey } = await import("./authentication.js");
+			this.throwIfStopped();
+			const apiKey =
+				this.config.cursorApiKey ??
+				process.env.CURSOR_API_KEY ??
+				(await loadCyrusCursorApiKey(this.config.cyrusHome));
+			this.throwIfStopped();
+			const { Agent, Cursor } = await import("@cursor/sdk");
+			this.throwIfStopped();
+			if (this.config.cursorAccountEmail !== undefined) {
+				const expectedEmail = this.config.cursorAccountEmail
+					.trim()
+					.toLowerCase();
+				if (!expectedEmail) {
+					throw new Error(
+						"cursorAccountEmail must identify the intended Cursor account",
+					);
+				}
+				let account: Awaited<ReturnType<typeof Cursor.me>>;
+				try {
+					account = await Cursor.me({
+						apiKey,
+						teamId: this.config.cursorTeamId,
+					});
+				} catch {
+					throw new Error(
+						"Could not verify the configured Cursor account. Authenticate Cyrus with the intended Cursor account before starting an agent.",
+					);
+				}
+				this.throwIfStopped();
+				if (
+					typeof account?.userEmail !== "string" ||
+					account.userEmail.trim().toLowerCase() !== expectedEmail
+				) {
+					throw new Error(
+						"The authenticated Cursor account does not match cursorAccountEmail. Authenticate Cyrus with the intended Cursor account before starting an agent.",
+					);
+				}
+			}
 			const normalizedModel = normalizeCursorModel(this.config.model);
-			const mcpServers = mapCyrusMcpToSdk(this.config.mcpConfig);
 			const stateRoot = join(
 				this.config.cyrusHome,
 				"cursor-sdk-state",
 				crypto.createHash("sha256").update(workspace).digest("hex"),
 			);
 			const { SqliteLocalAgentStore } = await import("@cursor/sdk/sqlite");
+			this.throwIfStopped();
 			localStore = await SqliteLocalAgentStore.open({
 				workspaceRef: workspace,
 				stateRoot,
 			});
+			this.throwIfStopped();
 			console.log(
 				`[CursorRunner] Opened Cursor SDK state store at ${stateRoot}`,
 			);
@@ -505,11 +572,27 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 			const sandboxEnabled = Boolean(this.config.sandboxSettings?.enabled);
 			const baseAgentOptions = {
 				apiKey,
+				...(this.config.cursorTools ? { tools: this.config.cursorTools } : {}),
+				...(this.config.cursorDisallowedTools
+					? { disallowedTools: this.config.cursorDisallowedTools }
+					: {}),
+				...(this.config.cursorTeamId !== undefined
+					? { teamId: this.config.cursorTeamId }
+					: {}),
 				...(normalizedModel ? { model: { id: normalizedModel } } : {}),
 				local: {
 					cwd: workspace,
 					store: localStore,
-					settingSources: ["project" as const],
+					// Project hooks must remain active even when user settings are enabled.
+					settingSources: [
+						...new Set([
+							"project" as const,
+							...(this.config.cursorSettingSources ?? []),
+						]),
+					],
+					...(this.config.additionalDirectories?.length
+						? { dirs: this.config.additionalDirectories }
+						: {}),
 					// SDK ≥1.0.11 auto-discovers the bundled `cursorsandbox`
 					// helper from the platform-specific optionalDependency
 					// (e.g. `@cursor/sdk-darwin-arm64`). The corresponding
@@ -521,7 +604,6 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 				...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
 			};
 
-			const { Agent } = await import("@cursor/sdk");
 			let agent: SDKAgent;
 			if (this.config.resumeSessionId) {
 				console.log(
@@ -535,6 +617,7 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 				agent = await Agent.create(baseAgentOptions);
 			}
 			this.agent = agent;
+			this.throwIfStopped();
 
 			if (this.sessionInfo) {
 				this.sessionInfo.sessionId = agent.agentId;
@@ -547,7 +630,8 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 
 			let caughtError: unknown;
 			try {
-				const run = await agent.send(prompt, {
+				this.throwIfStopped();
+				const run = await agent.send(buildCursorPrompt(prompt, this.config), {
 					onDelta: ({ update }) => {
 						// `turn-ended` is the only delta carrying token totals.
 						// Each fire is a per-turn snapshot — accumulate across
@@ -577,6 +661,10 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 					},
 				});
 				this.currentRun = run;
+				if (this.wasStopped) {
+					await run.cancel().catch(() => {});
+					this.throwIfStopped();
+				}
 				for await (const event of run.stream()) {
 					if (this.wasStopped) break;
 					this.handleSdkEvent(event);
@@ -589,6 +677,7 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 		} catch (error) {
 			this.finalizeSession(error);
 		} finally {
+			CursorRunner.activeRunners.delete(this);
 			if (localStore) {
 				try {
 					await localStore.dispose();
@@ -630,6 +719,10 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 		if (this.sessionInfo) {
 			this.sessionInfo.isRunning = false;
 		}
+	}
+
+	private throwIfStopped(): void {
+		if (this.wasStopped) throw new Error("Cursor session stopped");
 	}
 
 	isRunning(): boolean {
@@ -789,79 +882,21 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 
 	// ---------- Permission artifacts ----------
 
-	private installPermissionsArtifacts(workspace: string): void {
-		const cursorDir = join(workspace, ".cursor");
-		mkdirSync(cursorDir, { recursive: true });
-
-		// 1. Permissions config (auto-deny is merged in by the helper). Pass
-		// the SDK-shaped MCP server map so the helper can derive a logical
-		// server name (e.g. "linear") from the command/url that the
-		// `beforeMCPExecution` payload exposes — patterns like
-		// `Mcp(linear:save_comment)` only match when we provide that lookup.
-		const sdkMcpServers = mapCyrusMcpToSdk(this.config.mcpConfig);
+	private installPermissionsArtifacts(
+		workspace: string,
+		mcpServers: Record<string, CursorMcpServerConfig>,
+	): void {
 		const cfg: CyrusPermissionsConfig = buildCyrusPermissionsConfig({
 			workspace,
 			allowedTools: this.config.allowedTools,
 			disallowedTools: this.config.disallowedTools,
-			mcpServers: sdkMcpServers,
+			mcpServers,
 		});
-		writeFileSync(
-			join(cursorDir, "cyrus-permissions.json"),
-			`${JSON.stringify(cfg, null, "\t")}\n`,
-			"utf8",
+		this.permissionHooks = ProjectPermissionHooks.install(
+			workspace,
+			cfg,
+			this.locatePermissionCheckSource(),
 		);
-
-		// 2. Permission helper script (copied from package's bundled .mjs)
-		const helperDst = join(cursorDir, "cyrus-permission-check.mjs");
-		const helperSrc = this.locatePermissionCheckSource();
-		copyFileSync(helperSrc, helperDst);
-		try {
-			chmodSync(helperDst, 0o755);
-		} catch {}
-
-		// 3. Hooks config (back up any existing one)
-		const hooksPath = join(cursorDir, "hooks.json");
-		const existed = existsSync(hooksPath);
-		const backupPath = existed
-			? `${hooksPath}.cyrus-backup-${Date.now()}-${process.pid}`
-			: null;
-		if (existed && backupPath) {
-			renameSync(hooksPath, backupPath);
-		}
-		const hooksConfig = {
-			version: 1,
-			hooks: {
-				preToolUse: [
-					{ command: "./.cursor/cyrus-permission-check.mjs", failClosed: true },
-				],
-				beforeShellExecution: [
-					{ command: "./.cursor/cyrus-permission-check.mjs", failClosed: true },
-				],
-				beforeReadFile: [
-					{ command: "./.cursor/cyrus-permission-check.mjs", failClosed: true },
-				],
-				beforeMCPExecution: [
-					{ command: "./.cursor/cyrus-permission-check.mjs", failClosed: true },
-				],
-			},
-		};
-		writeFileSync(
-			hooksPath,
-			`${JSON.stringify(hooksConfig, null, "\t")}\n`,
-			"utf8",
-		);
-		this.hooksRestoreState = { hooksPath, backupPath };
-		this.permissionsArtifactsInstalled = true;
-
-		console.log(
-			`[CursorRunner] Installed Cyrus permission hooks at ${hooksPath} (allow=${cfg.allow.length}, deny=${cfg.deny.length}, backup=${backupPath ? "yes" : "no"})`,
-		);
-
-		// 4. Sandbox policy file (only when sandbox is enabled). Cursor's
-		// `local.sandboxOptions.enabled: true` engages Apple Seatbelt /
-		// Linux Landlock; the policy below extends the default
-		// `workspace_readwrite` profile with allow/deny lists translated
-		// from the Cyrus / Claude SandboxSettings shape.
 		this.installSandboxArtifacts(workspace);
 	}
 
@@ -874,67 +909,63 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 		});
 		if (!sandboxJson) return;
 
-		const cursorDir = join(workspace, ".cursor");
-		const sandboxPath = join(cursorDir, "sandbox.json");
-		const existed = existsSync(sandboxPath);
-		const backupPath = existed
-			? `${sandboxPath}.cyrus-backup-${Date.now()}-${process.pid}`
-			: null;
-		if (existed && backupPath) {
-			renameSync(sandboxPath, backupPath);
-		}
-		writeFileSync(
-			sandboxPath,
-			`${JSON.stringify(sandboxJson, null, "\t")}\n`,
-			"utf8",
-		);
-		this.sandboxRestoreState = { sandboxPath, backupPath };
-
-		// Apply env vars on `process.env` so any child shell process spawned
-		// by the SDK inherits them. We snapshot the previous values and
-		// restore them in `uninstallSandboxArtifacts`.
 		const env = buildSandboxEnv({
 			sandboxSettings: this.config.sandboxSettings,
 			egressCaCertPath: this.config.egressCaCertPath,
 		});
-		const restore = new Map<string, string | undefined>();
-		for (const k of Object.keys(env)) {
-			restore.set(k, process.env[k]);
-			process.env[k] = env[k];
+		if (Object.keys(env).length > 0 && CursorRunner.activeRunners.size > 1) {
+			throw new Error(
+				"Sandbox environment settings require exclusive Cursor execution in this process.",
+			);
 		}
-		this.sandboxEnvRestoreState = restore;
+		const cursorDir = join(workspace, ".cursor");
+		const sandboxPath = join(cursorDir, "sandbox.json");
+		const installed = `${JSON.stringify(sandboxJson, null, "\t")}\n`;
+		if (existsSync(sandboxPath)) {
+			let existing: unknown;
+			try {
+				existing = JSON.parse(readFileSync(sandboxPath, "utf8"));
+			} catch {
+				throw new Error(
+					"Existing Cursor sandbox.json is invalid. Repair it before starting Cyrus.",
+				);
+			}
+			if (!isDeepStrictEqual(existing, sandboxJson)) {
+				throw new Error(
+					"Cyrus sandbox settings conflict with the existing Cursor sandbox.json. Reconcile the policies before starting.",
+				);
+			}
+		} else {
+			if (!this.permissionHooks)
+				throw new Error("Cursor sandbox requires an active permission lease");
+			this.permissionHooks.installGeneratedSandbox(installed);
+		}
 
-		console.log(
-			`[CursorRunner] Installed Cursor sandbox policy at ${sandboxPath} (allowReadwrite=${sandboxJson.additionalReadwritePaths.length}, allowReadonly=${sandboxJson.additionalReadonlyPaths.length}, networkAllow=${sandboxJson.networkPolicy.allow.length}, backup=${backupPath ? "yes" : "no"})`,
-		);
+		if (Object.keys(env).length > 0) {
+			CursorRunner.sandboxEnvironmentOwner = this;
+			const restore = new Map<
+				string,
+				{ previous: string | undefined; installed: string }
+			>();
+			for (const [key, value] of Object.entries(env)) {
+				restore.set(key, { previous: process.env[key], installed: value });
+				process.env[key] = value;
+			}
+			this.sandboxEnvRestoreState = restore;
+		}
 	}
 
 	private uninstallSandboxArtifacts(): void {
-		const restore = this.sandboxRestoreState;
-		if (restore) {
-			try {
-				if (existsSync(restore.sandboxPath)) unlinkSync(restore.sandboxPath);
-				if (restore.backupPath && existsSync(restore.backupPath)) {
-					renameSync(restore.backupPath, restore.sandboxPath);
-				}
-			} catch (error) {
-				const detail = error instanceof Error ? error.message : String(error);
-				console.warn(
-					`[CursorRunner] Failed to restore sandbox.json at ${restore.sandboxPath}: ${detail}`,
-				);
-			}
-			this.sandboxRestoreState = null;
-		}
-		const envRestore = this.sandboxEnvRestoreState;
-		if (envRestore) {
-			for (const [k, v] of envRestore.entries()) {
-				if (v === undefined) {
-					delete process.env[k];
-				} else {
-					process.env[k] = v;
-				}
+		if (this.sandboxEnvRestoreState) {
+			for (const [key, value] of this.sandboxEnvRestoreState) {
+				if (process.env[key] !== value.installed) continue;
+				if (value.previous === undefined) delete process.env[key];
+				else process.env[key] = value.previous;
 			}
 			this.sandboxEnvRestoreState = null;
+		}
+		if (CursorRunner.sandboxEnvironmentOwner === this) {
+			CursorRunner.sandboxEnvironmentOwner = null;
 		}
 	}
 
@@ -956,36 +987,19 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 
 	private uninstallPermissionsArtifacts(): void {
 		this.uninstallSandboxArtifacts();
-		if (!this.permissionsArtifactsInstalled) return;
-		const workspace = resolve(this.config.workingDirectory || cwd());
-		const cursorDir = join(workspace, ".cursor");
-		const cfgPath = join(cursorDir, "cyrus-permissions.json");
-		const helperPath = join(cursorDir, "cyrus-permission-check.mjs");
-
+		this.managedSkills?.cleanup();
+		this.managedSkills = null;
+		this.workspaceSupport?.cleanup();
+		this.workspaceSupport = null;
+		if (!this.permissionHooks) return;
 		try {
-			if (existsSync(cfgPath)) unlinkSync(cfgPath);
-		} catch {}
-		try {
-			if (existsSync(helperPath)) unlinkSync(helperPath);
-		} catch {}
-
-		const hooks = this.hooksRestoreState;
-		if (hooks) {
-			try {
-				if (existsSync(hooks.hooksPath)) unlinkSync(hooks.hooksPath);
-				if (hooks.backupPath && existsSync(hooks.backupPath)) {
-					renameSync(hooks.backupPath, hooks.hooksPath);
-				}
-			} catch (error) {
-				const detail = error instanceof Error ? error.message : String(error);
-				console.warn(
-					`[CursorRunner] Failed to restore hooks at ${hooks.hooksPath}: ${detail}`,
-				);
-			}
+			this.permissionHooks.dispose();
+		} catch (error) {
+			console.warn(
+				`[CursorRunner] Could not remove session permission hooks: ${normalizeError(error)}`,
+			);
 		}
-
-		this.hooksRestoreState = null;
-		this.permissionsArtifactsInstalled = false;
+		this.permissionHooks = null;
 	}
 
 	// ---------- Internal helpers ----------
@@ -1129,6 +1143,7 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 
 	private finalizeSession(error?: unknown): void {
 		if (!this.sessionInfo) return;
+		if (this.wasStopped) error = new Error("Cursor session stopped");
 
 		this.emitInitMessage();
 		this.flushAssistantTextBuffer();
@@ -1136,7 +1151,9 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 		this.uninstallPermissionsArtifacts();
 
 		let resultMessage: SDKResultMessage;
-		if (this.pendingResultMessage) {
+		if (this.wasStopped) {
+			resultMessage = this.createErrorResultMessage("Cursor session stopped");
+		} else if (this.pendingResultMessage) {
 			resultMessage = this.pendingResultMessage;
 		} else if (error || this.errorMessages.length > 0) {
 			const message =
@@ -1172,6 +1189,9 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 			this.logStream = null;
 		}
 		this.currentRun = null;
+		try {
+			this.agent?.close();
+		} catch {}
 		this.agent = null;
 		this.pendingResultMessage = null;
 	}

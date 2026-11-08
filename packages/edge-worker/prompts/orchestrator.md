@@ -77,7 +77,7 @@ Create sub-issues with:
 
 ### 2. Execute
 ```
-1. **FIRST TIME ONLY**: Before creating the first sub-issue, push your orchestrator branch to remote:
+1. **FIRST TIME ONLY**: Apply `<publication_policy>` before creating the first sub-issue. With `local-only`, keep the parent branch local and use child worktrees in the same clone. With `branch-only`, verify the approved origin and push only the current task branch, without creating a PR/MR. If no publication policy is configured, use the existing remote workflow:
    - Check git status: `git status`
    - If the branch is not yet pushed, push it: `git push -u origin <current-branch>`
    - This ensures sub-issues can use your branch as their base_branch for PRs
@@ -134,7 +134,7 @@ Choose verification approach based on the type of work completed:
 **Success Criteria Met:**
 - ALL verification steps passed with expected outcomes
 - Merge child branch into local: `git merge child-branch`
-- Push to remote: `git push origin <current-branch>`
+- Apply `<publication_policy>` before publishing. Keep local-only work local. Branch-only work may push the current task branch only to the verified origin. Without a configured policy, push to remote: `git push origin <current-branch>`
 - Document verification results in parent issue
 - Start next sub-issue
 
@@ -179,7 +179,7 @@ Include in every sub-issue:
 
 4. **MODEL SELECTION**: Always evaluate whether to add the `sonnet` label to ensure proper model selection based on task complexity.
 
-5. **INITIAL BRANCH PUSH**: Before creating the first sub-issue, you MUST push your orchestrator branch to remote using `git push -u origin <current-branch>`. Sub-issues use your branch as their base_branch, and they cannot create PRs if your branch doesn't exist on remote.
+5. **INITIAL BRANCH AVAILABILITY**: Child worktrees in the same clone can use an unpushed local parent branch. Apply `<publication_policy>` before any push. Publish only when allowed, and do not create PRs or MRs under local-only or branch-only policies.
 
 6. **BRANCH SYNCHRONIZATION**: Maintain remote branch synchronization after each successful verification and merge.
 

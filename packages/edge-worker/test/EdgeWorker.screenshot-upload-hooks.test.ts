@@ -88,6 +88,7 @@ describe("EdgeWorker - Screenshot Upload Guidance Hooks", () => {
 			branchName: "test-branch",
 			state: { name: "Todo" },
 			team: { id: "team-123" },
+			inverseRelations: vi.fn().mockResolvedValue({ nodes: [] }),
 			labels: vi.fn().mockResolvedValue({
 				nodes: labels.map((name) => ({ name })),
 			}),

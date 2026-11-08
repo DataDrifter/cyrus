@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Limit an installation to selected execution providers, select a Cursor Team for new and resumed sessions, and choose local-only or branch-only completion without automatic PRs or MRs.
+- Sign Cyrus into a verified Cursor account with `self-auth-cursor` while preserving the global SDK login.
+
+### Fixed
+- Cursor sessions receive workflow instructions, complete skill folders, and configured MCP files while preserving existing project hooks.
+- Waiting dependency sessions survive restarts and pause when an interrupted start cannot be safely replayed.
+
 ## [0.2.76] - 2026-11-06
 
 ### Changed

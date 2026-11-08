@@ -81,6 +81,7 @@ export type {
 	OAuthCallbackHandler,
 	OpenCodeConfigOverrides,
 	OpenCodeStateScope,
+	PublicationPolicy,
 	RepoSetupHookEvent,
 	RepoSetupHookEventHandler,
 	RepoSetupHookStatus,
@@ -99,6 +100,7 @@ export {
 	migrateEdgeConfig,
 	NetworkPolicySchema,
 	OpenCodeConfigSchema,
+	PublicationPolicySchema,
 	RepositoryConfigPayloadSchema,
 	RepositoryConfigSchema,
 	RunnerTypeSchema,
@@ -290,3 +292,13 @@ export type {
 // Platform-agnostic webhook type aliases - exported from issue-tracker
 // These are now defined in issue-tracker/types.ts as aliases to Linear SDK webhook types
 // EdgeWorker and other high-level code should use these generic names via issue-tracker exports
+
+export {
+	ManagedSkillStager,
+	type ManagedSkillStagingInput,
+} from "./ManagedSkillStager.js";
+
+export {
+	WorkspaceSupportStager,
+	type WorkspaceSupportStagingInput,
+} from "./WorkspaceSupportStager.js";

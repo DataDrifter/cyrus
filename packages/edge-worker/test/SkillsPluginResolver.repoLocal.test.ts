@@ -89,6 +89,20 @@ describe("SkillsPluginResolver repo-local skill discovery", () => {
 		resolver = new SkillsPluginResolver(home, createTestLogger());
 	});
 
+	it("discovers Cursor and shared native skill installations", async () => {
+		for (const [harness, name] of [
+			[".agents", "build-auto"],
+			[".cursor", "research"],
+		]) {
+			const dir = join(repoA, harness!, "skills", name!);
+			await mkdir(dir, { recursive: true });
+			await writeFile(join(dir, "SKILL.md"), `# ${name}`);
+		}
+		expect(
+			await resolver.discoverSkillNames([], { repoPaths: [repoA] }),
+		).toEqual(["build-auto", "research"]);
+	});
+
 	afterEach(async () => {
 		for (const dir of [home, repoA, repoB]) {
 			await rm(dir, { recursive: true, force: true });

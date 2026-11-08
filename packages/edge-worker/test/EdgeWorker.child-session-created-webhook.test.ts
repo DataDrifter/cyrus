@@ -108,6 +108,10 @@ describe("EdgeWorker - child AgentSessionEvent.created webhooks", () => {
 	it("starts a created webhook for a child session already mapped to a parent", async () => {
 		const childSessionId = "child-session-123";
 		const parentSessionId = "parent-session-456";
+		vi.spyOn(edgeWorker as any, "fetchFullIssueDetails").mockResolvedValue({
+			id: "issue-123",
+			inverseRelations: vi.fn().mockResolvedValue({ nodes: [] }),
+		});
 		(edgeWorker as any).globalSessionRegistry.setParentSession(
 			childSessionId,
 			parentSessionId,

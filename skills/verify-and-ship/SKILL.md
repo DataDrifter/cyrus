@@ -71,13 +71,24 @@ git diff <base_branch> -- CHANGELOG.md CHANGELOG.internal.md 2>/dev/null
 - Include the Linear issue identifier and PR/MR link (format: `([ISSUE-ID](linear_url), [#NUMBER](PR_OR_MR_URL))`)
 - Follow [Keep a Changelog](https://keepachangelog.com/) format
 
-## 4. Commit and Push
+## 4. Apply Publication Policy and Commit
+
+Read `<publication_policy>` before any publishing action. With `local-only`,
+keep commits local and skip all pushes and PR/MR operations. With `branch-only`,
+verify the approved origin and push only the current task branch as instructed
+by that policy. Skip every PR/MR operation, including changelog links and
+readiness changes. Report a branch and commit instead of a PR/MR URL.
+
+Use the publishing steps below only when the active policy permits them.
 
 - Stage all relevant changes (including changelog updates)
 - Commit with clear, descriptive messages following the project's commit conventions
 - Push to the remote repository
 
 ## 5. Create or Update PR/MR
+
+Skip this section when `<publication_policy>` is present. A missing PR/MR is
+expected under `local-only` and `branch-only`.
 
 Determine the platform from the repository context (`<github_url>` or `<gitlab_url>` in the issue context). Use the appropriate tool for the platform.
 

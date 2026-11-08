@@ -51,6 +51,49 @@ describe("ConfigManager", () => {
 		}
 	});
 
+	it("reloads and removes provider, Cursor account, and publication policies", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "cyrus-provider-policy-"));
+		const path = join(dir, "config.json");
+		const manager = new ConfigManager(
+			{ repositories: [repo] },
+			logger,
+			path,
+			new Map([[repo.id, repo]]),
+		);
+		const changed = vi.fn();
+		manager.on("configChanged", (event) => {
+			changed(event);
+			manager.setConfig(event.newConfig);
+		});
+		const policy = {
+			allowedRunners: ["cursor"],
+			cursorTeamId: 42,
+			cursorAccountEmail: "agent@example.com",
+			workspaceSupportPaths: ["_workflow", ".agents/skills"],
+			cursorSettingSources: ["user", "project"],
+			publicationPolicy: { mode: "local-only" },
+		};
+		try {
+			await writeFile(
+				path,
+				JSON.stringify({ repositories: [repo], ...policy }),
+			);
+			await (
+				manager as unknown as { handleConfigChange(): Promise<void> }
+			).handleConfigChange();
+			expect(changed.mock.lastCall?.[0].newConfig).toMatchObject(policy);
+			await writeFile(path, JSON.stringify({ repositories: [repo] }));
+			await (
+				manager as unknown as { handleConfigChange(): Promise<void> }
+			).handleConfigChange();
+			for (const key of Object.keys(policy))
+				expect(changed.mock.lastCall?.[0].newConfig[key]).toBeUndefined();
+			expect(changed).toHaveBeenCalledTimes(2);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	let tempDir: string | undefined;
 
 	afterEach(async () => {

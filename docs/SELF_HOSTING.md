@@ -1,5 +1,9 @@
 # End-to-End Self-Hosting Guide
 
+For Cursor execution, follow [Linear to local Cursor](./CURSOR_LOCAL.md) for
+account selection, complete workflow installation, publishing controls, and
+acceptance requirements alongside this Linear onboarding guide.
+
 ## Quick Start (Recommended)
 
 If you're using any AI coding agent (Claude Code, Codex, Cursor, etc.), set up Cyrus with a single command:
@@ -58,7 +62,7 @@ node --version    # Should show v18 or higher
 You'll complete these steps:
 
 1. Set up a public URL for webhooks
-2. Configure Claude Code authentication
+2. Configure authentication for the selected execution provider
 3. Create a Linear OAuth application
 4. Install Cyrus and complete your environment file
 5. Start Cyrus, authorize with Linear, and add repositories
@@ -84,9 +88,19 @@ You'll need:
 
 ---
 
-## Step 2: Configure Claude Code Authentication
+## Step 2: Configure the Execution Account
 
-Cyrus needs Claude Code credentials. Choose one option and add it to your env file (`~/.cyrus/.env`):
+### Cursor
+
+Follow [Configure the execution account](./CURSOR_LOCAL.md#configure-the-execution-account)
+to authenticate the intended Cursor account and select its Team. Configure
+`defaultRunner: "cursor"` and `allowedRunners: ["cursor"]`, then continue to
+Step 3. Skip the Claude Code authentication options below. Cursor deployments
+use the Cursor SDK credential store and do not require separate Claude credentials.
+
+### Claude Code
+
+For the Claude runner, choose one option and add it to your env file (`~/.cyrus/.env`):
 
 **Option A: API Key** (recommended)
 ```bash

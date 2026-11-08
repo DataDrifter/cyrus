@@ -174,5 +174,5 @@ function evaluate() {
 }
 
 const decision = evaluate();
-log({ ts: Date.now(), event: eventName, decision, payload });
+log({ ts: Date.now(), event: eventName, permission: decision.permission });
 process.stdout.write(JSON.stringify(decision));

@@ -1,3 +1,8 @@
+export {
+	type CyrusCursorLoginOptions,
+	loadCyrusCursorApiKey,
+	loginCyrusCursor,
+} from "./authentication.js";
 export { CursorRunner } from "./CursorRunner.js";
 export {
 	buildAutoDenyPatterns,
